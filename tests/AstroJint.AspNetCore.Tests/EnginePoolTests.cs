@@ -67,6 +67,60 @@ public class EnginePoolTests
     }
 
     [Fact]
+    public async Task Rent_HandsOutTheMostRecentlyReturnedSlotFirst()
+    {
+        await using var pool = CreatePool(3, new Factory());
+        await pool.WarmUpAsync();
+        var a = await pool.RentAsync(CancellationToken.None);
+        var b = await pool.RentAsync(CancellationToken.None);
+        var c = await pool.RentAsync(CancellationToken.None);
+
+        pool.Return(a, discard: false);
+        pool.Return(b, discard: false);
+        pool.Return(c, discard: false);
+
+        // The engine that rendered last is the warmest, so the next request gets it, not the one idle for longest.
+        Assert.Same(c, await pool.RentAsync(CancellationToken.None));
+        Assert.Same(b, await pool.RentAsync(CancellationToken.None));
+        Assert.Same(a, await pool.RentAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Return_ServesTheLongestWaiterFirst()
+    {
+        await using var pool = CreatePool(1, new Factory());
+        var held = await pool.RentAsync(CancellationToken.None);
+        var first = pool.RentAsync(CancellationToken.None).AsTask();
+        var second = pool.RentAsync(CancellationToken.None).AsTask();
+        await Task.Delay(50);
+
+        pool.Return(held, discard: false);
+        Assert.Same(held, await WithTimeout(first));
+        Assert.False(second.IsCompleted);
+
+        pool.Return(held, discard: false);
+        Assert.Same(held, await WithTimeout(second));
+    }
+
+    [Fact]
+    public async Task Return_SkipsAWaiterThatGaveUp()
+    {
+        await using var pool = CreatePool(1, new Factory());
+        var held = await pool.RentAsync(CancellationToken.None);
+        using var cancellation = new CancellationTokenSource();
+        var cancelled = pool.RentAsync(cancellation.Token).AsTask();
+        var patient = pool.RentAsync(CancellationToken.None).AsTask();
+        await Task.Delay(50);
+        await cancellation.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => cancelled);
+
+        pool.Return(held, discard: false);
+
+        Assert.Same(held, await WithTimeout(patient));
+        Assert.Equal(0, pool.Idle);
+    }
+
+    [Fact]
     public async Task Rent_WaitsWhenEverySlotIsInUse()
     {
         await using var pool = CreatePool(1, new Factory());

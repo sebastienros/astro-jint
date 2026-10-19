@@ -22,6 +22,11 @@ builder.Services.AddAstro(options =>
 builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme).AddCookie();
 builder.Services.AddHealthChecks();
 
+// On-demand pages that set a Cache-Control header (max-age or s-maxage) are served from the output cache until it
+// expires: files in "Astro:OutputCache:Directory", or memory when it is not set.
+builder.Services.AddOptions<AstroOutputCacheOptions>().BindConfiguration("Astro:OutputCache");
+builder.Services.AddAstroOutputCache();
+
 // Behind a proxy, Astro should see the address, host and protocol that the visitor used. Only proxies on the loopback
 // interface are trusted until KnownProxies or KnownNetworks say otherwise.
 builder.Services.Configure<ForwardedHeadersOptions>(options =>
@@ -64,6 +69,7 @@ app.MapGet("/sign-out", async (HttpContext context) =>
     return Results.Redirect("/me");
 });
 
+app.UseOutputCache();
 app.UseAstro();
 
 app.Run();

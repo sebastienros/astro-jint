@@ -202,6 +202,50 @@ public class AstroModuleLoaderTests
     }
 
     [Fact]
+    public async Task AChunkImportedOnEveryRequest_IsLoadedOncePerEngine_AndNeverReparsed()
+    {
+        // Astro's router imports the chunk of a page with import() for every request. The engine keeps the module it
+        // evaluated, so the loader is asked once per file per engine; and the loader parses the file once per process.
+        using var dist = DistFolder.Create()
+            .WithServerFile("entry.mjs", "export const load = async () => (await import('./chunks/lazy.mjs')).nextId();")
+            .WithServerFile("chunks/lazy.mjs", "let id = 0; export const nextId = () => ++id;");
+        var loader = new CountingLoader(new AstroModuleLoader(Path.Combine(dist.DistPath, "server", "entry.mjs")));
+
+        using var first = new Engine(options => options.UseModules(loader));
+        using var second = new Engine(options => options.UseModules(loader));
+        var ids = new List<double>();
+        foreach (var engine in new[] { first, second })
+        {
+            var load = (await engine.Modules.ImportAsync("./entry.mjs")).Get("load");
+            for (var i = 0; i < 50; i++)
+            {
+                ids.Add(engine.Invoke(load).UnwrapIfPromise().AsNumber());
+            }
+        }
+
+        Assert.Equal(Enumerable.Range(1, 50).Concat(Enumerable.Range(1, 50)).Select(id => (double)id), ids);
+        Assert.Equal(4, loader.Loads); // entry and chunk, once per engine
+        Assert.Equal(2, loader.Parses); // entry and chunk, once for all engines
+    }
+
+    private sealed class CountingLoader(AstroModuleLoader inner) : IModuleLoader
+    {
+        public int Loads { get; private set; }
+
+        /// <summary>Files read from disk, which is where the loader parses: a cached file is never read again.</summary>
+        public int Parses { get; private set; }
+
+        public ResolvedSpecifier Resolve(string? referencingModuleLocation, ModuleRequest moduleRequest) => inner.Resolve(referencingModuleLocation, moduleRequest);
+
+        public ModuleRecord LoadModule(Engine engine, ResolvedSpecifier resolved)
+        {
+            Loads++;
+            Parses += inner.IsPrepared(ModuleFactory.LocationOf(resolved)) ? 0 : 1;
+            return inner.LoadModule(engine, resolved);
+        }
+    }
+
+    [Fact]
     public async Task EveryEngine_EvaluatesItsOwnCopyOfAModule()
     {
         using var dist = DistFolder.Create()

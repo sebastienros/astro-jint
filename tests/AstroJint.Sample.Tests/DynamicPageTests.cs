@@ -72,6 +72,34 @@ public class DynamicPageTests(SampleSite site)
     }
 
     [Fact]
+    public async Task AProductPageIsServedFromTheOutputCache()
+    {
+        // The page sets 'Cache-Control: public, max-age=60', so the host keeps the first render and replays it, with
+        // the request id that the middleware stamped on that render.
+        using var client = site.CreateClient();
+
+        using var first = await client.GetAsync("/products/2?currency=eur");
+        using var second = await client.GetAsync("/products/2?currency=eur");
+        using var other = await client.GetAsync("/products/2?currency=usd");
+
+        Assert.Equal(HttpStatusCode.OK, second.StatusCode);
+        Assert.Equal(first.Header("X-Request-Id"), second.Header("X-Request-Id"));
+        Assert.NotEqual(first.Header("X-Request-Id"), other.Header("X-Request-Id"));
+        Assert.Equal("EUR 81.88", (await second.ReadHtmlAsync()).Text("#price"));
+    }
+
+    [Fact]
+    public async Task APageWithoutCacheControlIsNotServedFromTheOutputCache()
+    {
+        using var client = site.CreateClient();
+
+        using var first = await client.GetAsync("/time");
+        using var second = await client.GetAsync("/time");
+
+        Assert.NotEqual(first.Header("X-Request-Id"), second.Header("X-Request-Id"));
+    }
+
+    [Fact]
     public async Task AProductPageNamesTheProduct()
     {
         using var client = site.CreateClient();

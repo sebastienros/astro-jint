@@ -11,3 +11,4 @@ obj/
 TestResults/
 BenchmarkDotNet.Artifacts/
 .env
+astro-cache/

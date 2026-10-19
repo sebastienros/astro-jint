@@ -1,4 +1,5 @@
 using AstroJint.AspNetCore;
+using Microsoft.AspNetCore.OutputCaching;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -19,7 +20,9 @@ public static class AstroApplicationBuilderExtensions
 
     /// <summary>
     /// Renders Astro's on-demand pages for every request that no other endpoint handles. The returned builder can
-    /// carry conventions that apply to on-demand pages only, such as authorization or rate limiting.
+    /// carry conventions that apply to on-demand pages only, such as authorization or rate limiting. With output
+    /// caching in the pipeline (<c>AddAstroOutputCache()</c> and <c>UseOutputCache()</c>), a page is cached for as
+    /// long as its <c>Cache-Control</c> header allows.
     /// </summary>
     public static IEndpointConventionBuilder MapAstro(this IEndpointRouteBuilder endpoints)
     {
@@ -31,7 +34,8 @@ public static class AstroApplicationBuilderExtensions
         return endpoints
             .MapFallback("{**path}", context => context.RequestServices.GetRequiredService<AstroApp>().RenderAsync(context))
             .WithDisplayName("Astro")
-            .WithMetadata(AstroEndpointMetadata.Instance);
+            .WithMetadata(AstroEndpointMetadata.Instance)
+            .CacheOutput(new AstroOutputCachePolicy());
 #pragma warning restore ASP0018
     }
 

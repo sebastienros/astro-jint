@@ -70,6 +70,9 @@ internal sealed class AstroModuleLoader : IModuleLoader
         return ModuleFactory.BuildSourceTextModule(engine, prepared);
     }
 
+    /// <summary>Whether the file has been parsed already (its parse is shared by every engine from then on).</summary>
+    internal bool IsPrepared(string key) => _modules.TryGetValue(key, out var prepared) && prepared.IsValueCreated;
+
     private (string? Key, string? Refusal) KeyOf(ModuleRequest moduleRequest, string? referencingModuleLocation)
     {
         var specifier = moduleRequest.Specifier;
