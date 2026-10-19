@@ -1,4 +1,3 @@
-using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 
 namespace AstroJint.AspNetCore;
@@ -8,16 +7,21 @@ namespace AstroJint.AspNetCore;
 /// <see cref="WarmUpAsync"/>, handed out to one caller at a time and, when a caller reports them as unhealthy,
 /// disposed of and replaced in the background.
 /// </summary>
+/// <remarks>
+/// The most recently returned object is handed out first. An engine that has just rendered a page has the modules of
+/// that page evaluated and its caches filled, and its data is still in the processor caches, so at low traffic a few
+/// engines do all the work and stay warm instead of every engine paying the first-render cost of every page in turn.
+/// </remarks>
 internal sealed partial class EnginePool<T> : IAsyncDisposable
     where T : class, IDisposable
 {
-    // A null entry is a wake-up call: a replacement failed, so a waiter should try to create one itself.
-    private readonly Channel<T?> _idle = Channel.CreateUnbounded<T?>();
+    private readonly Lock _lock = new();
+    private readonly Stack<T> _idle = new();
+    private readonly Queue<TaskCompletionSource<T?>> _waiters = new();
     private readonly Func<Task<T>> _create;
     private readonly ILogger _logger;
     private int _reserved;
-    private int _idleCount;
-    private volatile bool _disposed;
+    private bool _disposed;
 
     public EnginePool(int size, Func<Task<T>> create, ILogger logger)
     {
@@ -33,7 +37,16 @@ internal sealed partial class EnginePool<T> : IAsyncDisposable
     public int Reserved => Volatile.Read(ref _reserved);
 
     /// <summary>Objects that exist and wait for a caller.</summary>
-    public int Idle => Volatile.Read(ref _idleCount);
+    public int Idle
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _idle.Count;
+            }
+        }
+    }
 
     /// <summary>Creates up to <see cref="Size"/> objects in parallel. Failures are logged and retried on demand.</summary>
     public Task WarmUpAsync() => Task.WhenAll(Enumerable.Range(0, Size).Select(_ => Task.Run(CreateIntoPoolAsync)));
@@ -43,18 +56,24 @@ internal sealed partial class EnginePool<T> : IAsyncDisposable
     {
         while (true)
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-
-            while (_idle.Reader.TryRead(out var idle))
+            TaskCompletionSource<T?>? waiter = null;
+            lock (_lock)
             {
-                if (idle is not null)
+                ObjectDisposedException.ThrowIf(_disposed, this);
+
+                if (_idle.TryPop(out var idle))
                 {
-                    Interlocked.Decrement(ref _idleCount);
                     return idle;
+                }
+
+                if (!TryReserve())
+                {
+                    waiter = new TaskCompletionSource<T?>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _waiters.Enqueue(waiter);
                 }
             }
 
-            if (TryReserve())
+            if (waiter is null)
             {
                 try
                 {
@@ -63,33 +82,30 @@ internal sealed partial class EnginePool<T> : IAsyncDisposable
                 catch
                 {
                     Release();
-                    _idle.Writer.TryWrite(null);
+                    WakeOneWaiter();
                     throw;
                 }
             }
 
             T? slot;
-            try
+            using (cancellationToken.UnsafeRegister(static state => ((TaskCompletionSource<T?>)state!).TrySetCanceled(), waiter))
             {
-                slot = await _idle.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch (ChannelClosedException)
-            {
-                throw new ObjectDisposedException(GetType().Name);
+                slot = await waiter.Task.ConfigureAwait(false);
             }
 
             if (slot is not null)
             {
-                Interlocked.Decrement(ref _idleCount);
                 return slot;
             }
+
+            // A wake-up call without a slot: a replacement failed, so try to create one here, or wait again.
         }
     }
 
     /// <summary>Gives an object back. A discarded object is disposed of and replaced in the background.</summary>
     public void Return(T slot, bool discard)
     {
-        if (!discard && TryEnqueue(slot))
+        if (!discard && TryHandOver(slot))
         {
             return;
         }
@@ -97,7 +113,7 @@ internal sealed partial class EnginePool<T> : IAsyncDisposable
         slot.Dispose();
         Release();
 
-        if (!_disposed)
+        if (!Volatile.Read(ref _disposed))
         {
             _ = Task.Run(CreateIntoPoolAsync);
         }
@@ -105,16 +121,25 @@ internal sealed partial class EnginePool<T> : IAsyncDisposable
 
     public ValueTask DisposeAsync()
     {
-        _disposed = true;
-        _idle.Writer.TryComplete();
-
-        while (_idle.Reader.TryRead(out var slot))
+        List<T> idle;
+        List<TaskCompletionSource<T?>> waiters;
+        lock (_lock)
         {
-            if (slot is not null)
-            {
-                Interlocked.Decrement(ref _idleCount);
-                slot.Dispose();
-            }
+            _disposed = true;
+            idle = [.. _idle];
+            _idle.Clear();
+            waiters = [.. _waiters];
+            _waiters.Clear();
+        }
+
+        foreach (var slot in idle)
+        {
+            slot.Dispose();
+        }
+
+        foreach (var waiter in waiters)
+        {
+            waiter.TrySetException(new ObjectDisposedException(GetType().Name));
         }
 
         return ValueTask.CompletedTask;
@@ -122,15 +147,18 @@ internal sealed partial class EnginePool<T> : IAsyncDisposable
 
     private async Task CreateIntoPoolAsync()
     {
-        if (!TryReserve())
+        lock (_lock)
         {
-            return;
+            if (_disposed || !TryReserve())
+            {
+                return;
+            }
         }
 
         try
         {
             var slot = await _create().ConfigureAwait(false);
-            if (!TryEnqueue(slot))
+            if (!TryHandOver(slot))
             {
                 slot.Dispose();
                 Release();
@@ -140,21 +168,56 @@ internal sealed partial class EnginePool<T> : IAsyncDisposable
         {
             Release();
             LogCreateFailed(_logger, ex);
-            _idle.Writer.TryWrite(null);
+            WakeOneWaiter();
         }
     }
 
-    // Counting before writing keeps Idle from dipping below zero when a waiter takes the slot immediately.
-    private bool TryEnqueue(T slot)
+    // Gives the slot to the longest waiting caller, or keeps it as the next one to hand out. False once disposed.
+    private bool TryHandOver(T slot)
     {
-        Interlocked.Increment(ref _idleCount);
-        if (!_disposed && _idle.Writer.TryWrite(slot))
+        while (true)
         {
-            return true;
-        }
+            TaskCompletionSource<T?>? waiter;
+            lock (_lock)
+            {
+                if (_disposed)
+                {
+                    return false;
+                }
 
-        Interlocked.Decrement(ref _idleCount);
-        return false;
+                if (!_waiters.TryDequeue(out waiter))
+                {
+                    _idle.Push(slot);
+                    return true;
+                }
+            }
+
+            // A waiter that was cancelled in the meantime does not take the slot; the next one does.
+            if (waiter.TrySetResult(slot))
+            {
+                return true;
+            }
+        }
+    }
+
+    private void WakeOneWaiter()
+    {
+        while (true)
+        {
+            TaskCompletionSource<T?>? waiter;
+            lock (_lock)
+            {
+                if (!_waiters.TryDequeue(out waiter))
+                {
+                    return;
+                }
+            }
+
+            if (waiter.TrySetResult(null))
+            {
+                return;
+            }
+        }
     }
 
     private bool TryReserve()

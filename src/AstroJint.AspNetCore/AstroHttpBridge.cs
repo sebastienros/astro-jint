@@ -105,6 +105,9 @@ internal static class AstroHttpBridge
         AppendHeaders(target.Headers, response.Headers.NonValidated);
         AppendHeaders(target.Headers, content.Headers.NonValidated);
 
+        // The output cache fixes the lifetime of its copy when the response starts, so it has to know now.
+        AstroOutputCachePolicy.OnResponseStarting(context);
+
         if (status is 204 or 205 or 304 or < 200)
         {
             return Task.CompletedTask;

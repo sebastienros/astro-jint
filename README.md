@@ -92,7 +92,7 @@ The site is at <http://localhost:5080>.
 | | Pages |
 | --- | --- |
 | Prerendered | `/`, `/about`, `/blog`, `/blog/<slug>`, `/products`, the 404 and 500 pages; `/news` redirects to `/blog` |
-| On demand | `/time`, `/session` (a visit counter), `/me` (`Astro.locals` from ASP.NET Core authentication), `/contact` (form post, cookie, redirect), `/diagnostics` (`astro:env`, client address), `/products/<id>`, `/api/time`, `/api/echo` |
+| On demand | `/time`, `/session` (a visit counter), `/me` (`Astro.locals` from ASP.NET Core authentication), `/contact` (form post, cookie, redirect), `/diagnostics` (`astro:env`, client address), `/products/<id>` (cached for 60 s by its `Cache-Control`), `/api/time`, `/api/echo` |
 | Server island | the `ServerClock` component, rendered on demand inside a prerendered page |
 | Host endpoints | `/healthz`, `/api/host`, `/sign-in/<name>`, `/sign-out` |
 
@@ -138,6 +138,38 @@ Set them in `AddAstro(options => ...)`, bind them from configuration
 | `FetchUrlFilter` | none (rejects every request) | Decides which URLs JavaScript's `fetch` may request, for example the origin of a remote image. A `data:` URL is decoded in the engine and never reaches the filter. |
 | `SessionIdleTimeout` | 20 minutes | How long session data is kept after its last use. |
 
+### Output caching: `AddAstroOutputCache()`
+
+A page that is rendered on demand can still be served from a cache when its content allows it, the way a CDN in front
+of the host would do it. The page decides, with the header a CDN would read:
+
+```astro
+---
+export const prerender = false;
+Astro.response.headers.set('Cache-Control', 'public, max-age=60');
+---
+```
+
+```csharp
+builder.Services.AddAstroOutputCache(options => options.Directory = "astro-cache"); // or leave it in memory
+// ...
+app.UseOutputCache(); // before UseAstro()
+app.UseAstro();
+```
+
+The response is kept for `s-maxage`, else `max-age`, and served to anonymous `GET` and `HEAD` requests with the same
+path and query string. It is never kept with `no-store`, `no-cache` or `private`, with a `Set-Cookie`, for a request
+with an `Authorization` header or an authenticated user, or with a status that a cache may not reuse (RFC 9111). A
+hit costs what a prerendered file costs ([spike 5](docs/spikes/05-output-cache.md)). `MapAstro()` attaches the policy
+to the on-demand endpoint, where it does nothing until `UseOutputCache()` is in the pipeline, and a `CacheOutput(...)`
+of your own on the returned builder is applied after it.
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `Directory` | `null` (memory) | Folder with one file per cached response, so that the cache survives a restart (a page keeps answering at once after a deploy) and is shared by instances that see the same folder. Relative to the content root. |
+| `VaryByHeaders` | empty | Request headers that are part of the cache key, such as `Accept-Language`. A response whose `Vary` names a header that is not listed is not cached. |
+| `SweepInterval` | 10 minutes | How often expired files are deleted. An expired file is also deleted when it is requested. `TimeSpan.Zero` turns the sweep off. |
+
 ### Composing with ASP.NET Core
 
 - `UseAstro()` is `UseAstroStaticFiles()` followed by `MapAstro()`. `MapAstro()` registers a fallback endpoint and
@@ -152,8 +184,9 @@ Set them in `AddAstro(options => ...)`, bind them from configuration
 
 This is a prototype built on an interpreter. Know these before you plan on it:
 
-- **Jint is not V8.** A page whose JavaScript does a lot of work costs more here than in Node.js. Small pages render in
-  about a millisecond, but measure your own.
+- **Jint is not V8.** A page costs 5 to 6 times more here than in Node.js: small pages render in about a millisecond,
+  but measure your own. Prerender what does not need the request, and let the pages that can be reused for a while say
+  so with `Cache-Control` (see [output caching](#output-caching-addastrooutputcache)).
 - **No Node.js APIs.** The server bundle must be self-contained: `node:*` built-ins and packages that stay external are
   not available. `astro build` warns about server code that imports something outside the bundle, and every on-demand
   route that needs that file answers 500 (all of them, for a middleware). Prerendered pages keep working. Importing other
@@ -184,8 +217,9 @@ This is a prototype built on an interpreter. Know these before you plan on it:
 
 ## Performance
 
-Numbers are from a 28-processor Windows workstation and the sample site. The method and every table are in
-[spike 4](docs/spikes/04-host-performance.md); [benchmarks/README.md](benchmarks/README.md) shows how to repeat them.
+Numbers are from a 28-processor Windows workstation and the sample site, unless a bullet names another machine. The
+method and every table are in [spike 4](docs/spikes/04-host-performance.md) and [spike 5](docs/spikes/05-output-cache.md);
+[benchmarks/README.md](benchmarks/README.md) shows how to repeat them.
 
 - **Prerendered pages are served from memory.** The adapter spends about 0.35 microseconds and allocates 0.6 KB for one
   (285 to 360 times less than opening the file for each request), and the sample host serves 29,000 to 34,000 of them
@@ -204,8 +238,18 @@ Numbers are from a 28-processor Windows workstation and the sample site. The met
   times fewer on-demand requests per second and spent 80 percent of its time paused in the collector. Fewer GC heaps,
   no GC affinity, concurrent GC off, pool sizes of 20 and 40, and `TieredPGO` off did not beat the defaults beyond the
   noise; a 256 MB gen0 budget was 10 percent slower.
-- Compression and caching of on-demand pages are not part of the adapter. A reverse proxy or a CDN in front of the host
-  is the usual place for them.
+- **Jint is 5 to 6 times slower than Node.js per page.** On an Apple M4 Pro the same site renders `/time` in 0.84 ms
+  through Kestrel and in 0.16 ms through the official Node.js adapter; the API route costs about the same in both. With
+  14 engines the host answers as many pages per second as one Node.js process, and the first page of a fresh process
+  costs 100 ms (the JIT), or 390 ms without `WarmUp` ([spike 5](docs/spikes/05-output-cache.md)).
+- **A cached on-demand page costs what a prerendered one costs.** With `AddAstroOutputCache()`, `/products/1` goes from
+  1.0 ms and 590 requests per second at one connection to 0.10 ms (memory) or 0.13 ms (files) and 7,000 to 9,000, and
+  from 10,800 to 29,000 requests per second at 14 connections. After a restart a page in the file cache answers in
+  10 ms instead of waiting 390 ms for an engine. A page that cannot be cached still costs the interpreter.
+- **The pool hands out the engine that rendered last**, not the one idle for longest, so that at low traffic a few
+  engines stay warm. That is 15 to 25 percent lower latency at one connection and no change under load.
+- Compression of on-demand pages is not part of the adapter. A reverse proxy or a CDN in front of the host is the
+  usual place for it, and for caching across machines.
 
 ## Repository layout
 
@@ -278,6 +322,8 @@ what is ported, adapted, a known gap or not applicable, and why.
 - Precompressed prerendered files (`br` and `gzip` made at build time, chosen by `Accept-Encoding` in the static fast
   path), and a `byte[]` or `ReadOnlyMemory<byte>` overload of Jint's fetch-handler hosting, which would save a copy of
   every request and response body.
+- Cache data on the .NET side (`HybridCache`) and hand it to the pages that the output cache cannot help through
+  `Astro.locals`; an `IOutputCacheStore` on Redis for instances that do not share a folder.
 - Publish the packages. While Jint is a preview, `AstroJint.AspNetCore` has to carry a prerelease version too: NuGet
   rejects a stable package that depends on a prerelease one (NU5104).
 

@@ -127,6 +127,19 @@ export default {
       case '/count':
         return json({ handled });
 
+      // A response with the headers of the query (cc = Cache-Control, vary = Vary, cookie = Set-Cookie, code = status),
+      // for the output cache tests. The engine id and the count tell a cached copy from a fresh render.
+      case '/cached': {
+        const headers = { 'content-type': 'application/json' };
+        if (query.has('cc')) headers['cache-control'] = query.get('cc');
+        if (query.has('vary')) headers['vary'] = query.get('vary');
+        if (query.has('cookie')) headers['set-cookie'] = query.get('cookie');
+        return new Response(JSON.stringify({ engine: engineId, handled, lang: request.headers.get('accept-language') }), {
+          status: Number(query.get('code') ?? 200),
+          headers,
+        });
+      }
+
       case '/session-get': {
         const value = await host.sessionGet(query.get('id'));
         busyWait(Number(query.get('hold') ?? 0));
