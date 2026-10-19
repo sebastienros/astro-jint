@@ -50,7 +50,14 @@ Median latency (p50) and requests per second, same site, same pages:
 | `/blog` (prerendered) | 0.10 ms, 9,800 req/s | 0.14 ms, 6,900 req/s | 0.48 ms, 26,000 req/s | 0.86 ms, 16,000 req/s |
 
 So per request, a page costs 5 to 6 times more in the interpreter than in V8, which is the "10x"
-that a sequential comparison shows once curl's own overhead is in both numbers. Node.js is one thread,
+that a sequential comparison shows once curl's own overhead is in both numbers. The comparison is
+fair on the parsing side: the host parses each file of the bundle once per process and shares the
+`Prepared<Module>` between engines, and an engine keeps the modules it evaluated, so the `import()`
+that Astro's router runs for every request loads nothing after the first one on that engine. A 5
+second CPU sampling trace (`dotnet-trace`) of the host under the 14-connection `/time` load, about
+30,000 renders, holds no frame of the parser (Acornima) or of the module loader at all, and
+`AChunkImportedOnEveryRequest_IsLoadedOncePerEngine_AndNeverReparsed` in the loader tests pins it:
+two engines, 50 dynamic imports each, four module loads and two parses. Node.js is one thread,
 so with 14 engines the host answers as many pages per second as the single Node.js process, and more
 API routes; a Node.js cluster of 14 would be far ahead.
 
